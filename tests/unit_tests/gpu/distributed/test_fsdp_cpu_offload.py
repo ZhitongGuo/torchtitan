@@ -82,9 +82,9 @@ def _offload_policy(module: nn.Module) -> object | None:
     """
     state = _get_module_fsdp_state(module)
     assert state is not None, f"{type(module).__name__} was not sharded"
-    group = state._fsdp_param_group
-    assert group is not None, f"{type(module).__name__} owns no parameters"
-    return group.offload_policy
+    groups = state._fsdp_param_groups
+    assert groups, f"{type(module).__name__} owns no parameters"
+    return groups[0].offload_policy
 
 
 def _vision_inputs(
