@@ -20,7 +20,6 @@ from torch.distributed.fsdp import (
 from torch.distributed.tensor import Shard
 
 from torchtitan.config.parallelism import FSDPSymmMemScope
-from torchtitan.distributed.fsdp_lifecycle import complete_fsdp_grouped_forward
 from torchtitan.distributed.parallelism_context import ParallelismContext
 from torchtitan.models.base.module import Module
 from torchtitan.models.common.linear import GroupedLinear
@@ -54,7 +53,7 @@ def post_validate_fsdp_for_accelerator_graph(model_parts: list[nn.Module]) -> No
         for module in model.modules():
             if not isinstance(module, FSDPModule):
                 continue
-            complete_fsdp_grouped_forward(module, None)
+            module.complete_grouped_forward()
             module.reshard()
 
 

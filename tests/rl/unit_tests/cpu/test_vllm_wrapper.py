@@ -315,7 +315,7 @@ class TestLoadModelStateDictTwoRanks(DTensorTestBase):
             if isinstance(module, FSDPModule):
                 model_wrapper._unshard_and_free_sharded_params(module)
         # As in compute_logits: calling lm_head alone leaves the tied group's forward
-        # incomplete, so module.reshard() would skip it.
+        # incomplete, which the load must reshard anyway.
         model._get_fsdp_state()._lazy_init()  # the root's forward would do this
         with torch.no_grad():
             model.lm_head(torch.zeros(1, 16))

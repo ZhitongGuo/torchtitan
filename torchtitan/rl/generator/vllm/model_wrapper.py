@@ -13,7 +13,7 @@ TorchTitan models for vLLM.
 
 import copy
 import dataclasses
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable
 from typing import Any, cast
 
 import spmd_types as spmd
@@ -294,28 +294,6 @@ def _patch_vllm_all_reduce() -> None:
     )
 
 
-def _sharded_param_storages(module: FSDPModule) -> Iterator[torch.Tensor]:
-    """Yield the sharded parameter tensors of ``module``'s FSDP group."""
-    for param_group in module._get_fsdp_state()._fsdp_param_groups:
-        for param in param_group.fsdp_params:
-            sharded_data = param._sharded_param_data
-            if isinstance(sharded_data, _ShardedFSDPTensor):
-                sharded_data = sharded_data._tensor
-            yield sharded_data
-
-
-def _reshard(module: FSDPModule) -> None:
-    """Reshard ``module``'s FSDP group unconditionally, like FSDP's load_state_dict pre-hook.
-
-    ``module.reshard()`` is a no-op for a group left in the FORWARD state with
-    reshard_after_forward=False, e.g. the tied [tok_embeddings, norm, lm_head]
-    group after ``compute_logits`` calls lm_head alone.
-    """
-    # TODO: replace with a public FSDP API that reshards regardless of training state.
-    for param_group in module._get_fsdp_state()._fsdp_param_groups:
-        param_group._to_sharded()
-
-
 def _restore_sharded_params(module: FSDPModule) -> None:
     """Re-allocate the sharded buffers of `module`'s FSDP group so new weights can be copied in.
 
@@ -323,14 +301,11 @@ def _restore_sharded_params(module: FSDPModule) -> None:
     after:   sharded: allocated, uninitialized  unsharded: unchanged
 
     FSDP's own load pre-hook may have resharded the group already (e.g.
-    tok_embeddings), so ``is_sharded`` can be True while the storage is still
-    freed; allocate unconditionally.
+    tok_embeddings), so the parameters can be sharded while their storage is
+    still freed; allocate unconditionally.
     """
-    from torch.distributed.fsdp._fully_shard._fsdp_param import alloc_storage
-
-    # TODO: replace this with FSDPModule._restore_sharded_params()
-    for sharded_data in _sharded_param_storages(module):
-        alloc_storage(sharded_data)
+    # TODO: use a public FSDP API once there is one.
+    module._restore_sharded_params()
 
 
 def _unshard_and_free_sharded_params(module: FSDPModule) -> None:
@@ -341,13 +316,10 @@ def _unshard_and_free_sharded_params(module: FSDPModule) -> None:
 
     The unshard is explicit because CUDA graph replays skip FSDP's forward pre-hook.
     """
-    from torch.distributed.fsdp._fully_shard._fsdp_param import free_storage
-
     with torch.inference_mode():
         module.unshard()
-        # TODO: replace this with FSDPModule._free_sharded_params()
-        for sharded_data in _sharded_param_storages(module):
-            free_storage(sharded_data)
+        # TODO: use a public FSDP API once there is one.
+        module._free_sharded_params()
 
 
 def _fsdp_load_groups(
@@ -611,7 +583,7 @@ class VLLMModelWrapper(Module):
         for module, keyed_params in self._fsdp_load_groups:
             # unshard() is a no-op while the group is unsharded. Resharding registers
             # the sharded parameters and keeps the unsharded storage CUDA graphs read.
-            _reshard(module)
+            module.reshard()
             _restore_sharded_params(module)
             # After a failed fetch, keep unsharding the remaining groups: unshard()
             # all-gathers across the FSDP group and the other ranks are still loading.
