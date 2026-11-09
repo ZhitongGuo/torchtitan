@@ -5,6 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 import asyncio
+import os
+import pathlib
 import sys
 from types import SimpleNamespace
 
@@ -477,18 +479,26 @@ def test_spawn_proc_mesh_checks_gpus_per_host_before_spawning(
 
 
 class _Worker:
+    """Its `close` leaves a file: the test can't read a worker process's memory."""
+
+    def __init__(self, marker_dir):
+        self.marker_dir = marker_dir
+
     async def close(self):
-        pass
+        pathlib.Path(self.marker_dir, f"closed-{os.getpid()}").touch()
 
 
 class _WorkerConfig:
+    def __init__(self, marker_dir):
+        self.marker_dir = marker_dir
+
     def build(self):
-        return _Worker()
+        return _Worker(self.marker_dir)
 
 
-def test_spawn_rollout_workers_returns_one_handle_per_worker():
+def test_spawn_rollout_workers_returns_one_handle_per_worker(tmp_path):
     """5 workers on this host come back as 5 single-actor handles (`call_one` raises on a
-    handle to several actors)."""
+    handle to several actors). Stopping them closes each worker (Monarch's `__cleanup__`)."""
 
     async def run():
         system = MonarchActorSystem(MonarchActorSystem.Config())
@@ -496,7 +506,7 @@ def test_spawn_rollout_workers_returns_one_handle_per_worker():
         cloudpickle.register_pickle_by_value(sys.modules[__name__])
         try:
             workers = await system.spawn_rollout_workers(
-                _WorkerConfig(), num_workers=5, num_threads=1
+                _WorkerConfig(str(tmp_path)), num_workers=5, num_threads=1
             )
             assert len(workers) == 5
             await asyncio.gather(
@@ -507,6 +517,7 @@ def test_spawn_rollout_workers_returns_one_handle_per_worker():
             cloudpickle.unregister_pickle_by_value(sys.modules[__name__])
 
     asyncio.run(run())
+    assert len(list(tmp_path.glob("closed-*"))) == 5
 
 
 def test_monarch_actor_system_provisions_every_role_before_spawning(monkeypatch):
