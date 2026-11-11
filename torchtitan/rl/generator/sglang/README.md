@@ -75,6 +75,7 @@ scripts/install_rl_env.sh --sglang
 | `reset_kv_cache_on_model_state_dict_load` | Supported: running requests are retracted and recompute their KV |
 | Multi-turn session KV | Supported, always on; see below |
 | CPU KV offload (SGLang HiCache) | Supported through `extra_server_args`; see below |
+| KV shared across generators (Mooncake Store) | Supported through `extra_server_args`; see below |
 | Batch-invariant mode | Supported; see below |
 | Per-request metrics (queue time, TTFT, prefill, decode, preemptions, cached tokens) | Supported |
 | Data parallelism within a generator | Not supported: run more generators |
@@ -211,6 +212,80 @@ more than copying its KV: for Qwen3-0.6B, recompute is faster.
 KDA models raise with HiCache for now (#6015). TODO: with HiCache's `write_through`
 policy (SGLang's default), one run in 18 of the KDA parity class mismatched the
 trainer (max logprob delta 3.1e-2); not root-caused.
+
+## Shared KV across generators (Mooncake Store)
+
+[Mooncake Store](https://github.com/kvcache-ai/Mooncake) adds a KV tier below
+HiCache's host memory that all generators share, so a session's next turn that
+lands on another generator loads its history's KV instead of recomputing it:
+
+```text
+turn 1 on generator A: prefill, decode; HiCache copies the KV to host memory and the Store
+turn 2 on generator B: GPU and host miss, Store hit -> load the history's KV,
+                       prefill only the new tokens
+```
+
+Run one `mooncake_master` and give the Store memory, e.g. with a
+`mooncake_client` per host (`pip install mooncake-transfer-engine`, or
+`mooncake-transfer-engine-cuda13` for CUDA 13 PyTorch):
+
+```bash
+mooncake_master -port 50051
+mooncake_client -host <host ip> -master_server_address <master>:50051 \
+    -metadata_server P2PHANDSHAKE -protocol rdma -device_names mlx5_0 \
+    -global_segment_size 64GB
+```
+
+```python
+SGLangEngine.Config(
+    extra_server_args={
+        "enable_hierarchical_cache": True,
+        "hicache_size": 64,  # GB of host memory per rank
+        "hicache_storage_backend": "mooncake",
+        "hicache_storage_backend_extra_config": json.dumps(
+            {
+                "master_server_address": "<master>:50051",
+                "metadata_server": "P2PHANDSHAKE",
+                "protocol": "rdma",
+                "device_name": "mlx5_0",
+                # Store memory comes from the mooncake_client processes; memory a
+                # generator contributes, and the KV in it, goes away with it.
+                "global_segment_size": "0",
+                "extra_backend_tag": f"my-run-{uuid.uuid4().hex}",
+            }
+        ),
+    }
+)
+```
+
+- Keep HiCache's default `write_through` policy: with `write_back`, KV reaches
+  the Store only when evicted from GPU memory.
+- A Store key is `extra_backend_tag`, the model path, the request's cache salt
+  (its pinned policy version), the token prefix and the TP rank. So:
+  - `extra_backend_tag` must be new for each launch, including a resume (the
+    engine raises without one): the Store outlives a run and policy versions
+    restart, so an old tag could serve KV that other weights computed.
+  - A request reuses another generator's KV only under the same pinned policy
+    version, as with the GPU prefix cache.
+  - Generators sharing a tag need the same TP degree: keys carry the TP rank,
+    not the degree.
+- `reset_kv_cache_on_model_state_dict_load` raises with a storage backend:
+  requests then have no cache salt, and SGLang's KV reset leaves the Store as
+  is, so they would read KV of earlier weights. SGLang never deletes Store keys;
+  Mooncake evicts them when the Store is full.
+- With 1-token pages (see `_build_server_args`), the Store holds one object per
+  token, K and V, and TP rank.
+
+Checked: with Qwen3-0.6B (TP 2, batch-invariant mode), a second turn on a fresh
+generator loaded 649 of its 650 history tokens from the Store and decoded the
+same tokens and logprobs, bitwise, as recomputing them; another tag or policy
+version loaded nothing. Second turn of 4 sessions of 16K tokens (TP 2, H100,
+one RDMA NIC):
+
+| Model | Recompute (s) | Load from the Store (s) |
+| --- | ---: | ---: |
+| Qwen3-8B | 1.39 | 1.85 |
+| Qwen3-32B | 5.27 | 2.43 |
 
 ## Seeds
 
