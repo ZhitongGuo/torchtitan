@@ -31,14 +31,17 @@ from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
 from torchtitan.distributed.local_compile import compile
 from torchtitan.distributed.parallelism_context import MeshAxisName
-from torchtitan.distributed.spmd_types import spmd_mesh_group
+from torchtitan.distributed.spmd_types import (
+    maybe_invariant_to_replicate,
+    spmd_mesh_group,
+)
 from torchtitan.models.base.module import Module
 from torchtitan.models.common.attention import (
     FlexInnerAttention,
     local_head_split,
     VarlenAttentionMetadata,
 )
-from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.linear import Linear, maybe_gather_tp_input
 from torchtitan.models.common.nn_modules import GELU, LayerNorm, RMSNorm
 
 compiled_create_block_mask = compile(create_block_mask)
@@ -218,6 +221,10 @@ class VisionAttention(Module):
         attention_mask: BlockMask | VarlenAttentionMetadata,
     ) -> torch.Tensor:
         num_tokens = x.shape[0]
+        # The q/k/v projections share one TP-replicated input; the rope cache
+        # must match the head-sharded q/k.
+        x = maybe_gather_tp_input(self, x)
+        rope_cache = maybe_invariant_to_replicate(rope_cache, MeshAxisName.TP)
 
         # -1 infers the head count locally (= num_heads / TP under tensor
         # parallelism, where wq/wk/wv are colwise-sharded).
